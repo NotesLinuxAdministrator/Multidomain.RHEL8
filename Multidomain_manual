@@ -1,0 +1,249 @@
+Для реализации, мы будем использовать демон служб системной безопасности 
+(SSSD), который выступает в качестве посредника между локальными сервером и 
+AD, имея возможность кэшировать учетные данные в случае, если хост или 
+поставщик удаленных удостоверений переходят в автономный режим.
+
+Обратите внимание, что это руководство можно воспроизвести RHEL/Centos/Oracle 
+Linux 8.x
+
+Порты, необходимые для прямой интеграции систем Linux в AD с использованием 
+SSSD:
+DNS, 53 (UDP, TCP)
+LDAP, 389 (UDP, TCP)
+Керберос, 88 (UDP, TCP)
+Kerberos, 464 (UDP, TCP) - Используется kadmin для настройки и изменения passwd
+Глобальный каталог LDAP, 3268 (TCP) 
+NTP, 123 (UDP) - опционально
+
+Необходимые пакеты:
+~]# dnf install realmd oddjob oddjob-mkhomedir sssd adcli krb5-workstation
+Используйте realm, чтобы проверить, какие обнаружиться первые контроллеры 
+домена через DNS:
+~]#  realm -v discover ad.domain.ru
+
+ * Resolving: _ldap._tcp.ad.domain.ru
+ * Resolving: ad.domain.ru
+ * Performing LDAP DSE lookup on: 10.1.1.101
+ * Performing LDAP DSE lookup on: 10.1.1.102
+ * Successfully discovered: ad.domain.ru
+ad.domain.ru
+ type: kerberos
+ realm-name: AD.DOMAIN.RU
+ domain-name: ad.domain.ru
+ configured: no
+ server-software: active-directory
+ client-software: sssd
+ required-package: oddjob
+ required-package: oddjob-mkhomedir
+ required-package: sssd
+ required-package: adcli
+ required-package: samba-common-tools
+
+Поскольку первый домен можно найти через DNS, мы можем просто 
+присоединиться к первому домену с присоединением к AD. Realm автоматически 
+создает конфигурацию sssd, добавляя pam, nss и настройки для domain и запуская 
+необходимые службы.
+
+~]# realm join -v ad.domain.ru --computer-
+ou="Servers,ou=Production,dc=ad,dc=domain,dc=ri" -U "admin@AD.DOMAIN.RU"
+
+Поскольку realm нельзя использовать для присоединения и автоматизации 
+конфигурации вторичного домена, необходимо делать все вручную. Мы можем 
+начать с настройки /etc/krb5.conf и включить дополнительный домен в файл 
+конфигурации, чтобы позже запросить Kerberos TGT:
+[logging]
+  default = FILE:/var/log/krb5libs.log
+  kdc = FILE:/var/log/krb5kdc.log
+  admin_server = FILE:/var/log/kadmind.log
+
+[libdefaults]
+  dns_lookup_realm = false
+  ticket_lifetime = 24h
+  renew_lifetime = 7d
+  forwardable = true
+  rdns = false
+  pkinit_anchors = FILE:/etc/pki/tls/certs/ca-bundle.crt
+  spake_preauth_groups = namegroup
+  default_ccache_name = KEYRING:persistent:%{uid}
+  udp_preference_limit = 0
+
+[realms]
+AD.DOMAIN.RU = {
+   kdc = dc01.ad.domain.ru:88
+   admin_server = ad.example.net
+}
+OLD.DOMAIN.RU = {
+  kdc = dcs.old.domain.ru:88
+  admin_server = dcs.domain.ru
+
+[domain_realm]
+ad.domain.ru = AD.DOMAIN.RU
+ad.domain.ru = AD.DOMAIN.RU
+old.domain.ru = OLD.DOMAIN.RU
+old.domain.ru = OLD.DOMAIN.ru
+
+Предполагая, что ваш DNS может разрешать только адреса AD.DOMAIN.RU, и вам не 
+было предоставлено информации о новом домене, кроме DNS-адреса 10.2.2.120, вы 
+можете начать с запроса в зонах _dcs для записей SRV, чтобы найти контроллеры 
+домена AD:
+# dig -t SRV _ldap._tcp.dc._dcs.domain.ru @10.2.2.120
+
+; <<>> DiG 9.11.26-RedHat-9.11.26-4.el8_4 <<>> -t SRV _ldap._tcp.dc._dcs.domain.ru 
+@10.2.2.120
+;; global options: +cmd
+;; Got answer:
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 9134
+;; flags: qr rd ra; QUERY: 1, ANSWER: 40, AUTHORITY: 0, ADDITIONAL: 1
+
+;; OPT PSEUDOSECTION:
+; EDNS: version: 0, flags:; udp: 4000
+;; QUESTION SECTION:
+;_ldap._tcp.dc._dcs.domain.ru. IN SRV
+
+;; ANSWER SECTION:
+_ldap._tcp.dc._dcs.old.domain.ru. 238 IN SRV 0 100 389 dc01.old.domain.ru.
+_ldap._tcp.dc._dcs.old.domain.ru. 238 IN SRV 0 100 389 dc02.old.domain.ru.
+<output omitted>
+А затем, найдя один из DC, мы можем запросить его IP-адрес, чтобы использовать 
+его в качестве нашего основного DC:
+~]# dig dc01.old.domain.ru @10.2.2.120
+                                 
+; <<>> DiG 9.11.26-RedHat-9.11.26-4.el8_4 <<>> dc01.old.domain.ru @10.2.2.120
+;; global options: +cmd               
+;; Got answer:
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 53123
+;; flags: qr rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 1               
+                                                 
+;; OPT PSEUDOSECTION:                                       
+; EDNS: version: 0, flags:; udp: 4000                                             
+;; QUESTION SECTION:                                       
+; dc01.old.domain.ru. IN  A                             
+                                                 
+;; ANSWER SECTION:                                        
+dc01.old.domain.ru. 753 IN A    10.2.2.101
+Мы включаем конкретный сервер MSAD в /etc/hosts:
+# echo "10.2.2.101 dc01.old.domain.ru  old.domain.ru" >> /etc/hosts
+Теперь мы можем запросить TGT, который мы собираемся использовать в процессе, 
+чтобы присоединить сервер к вторичному домену:
+# kinit -V admin@OLD.DOMAIN.RU
+
+Using default cache: 0
+Using principal: admin@OLD.DOMAIN.RU
+Password for admin@OLD.DOMAIN.RU:
+Authenticated to Kerberos v5
+И, наконец, мы можем подключить компьютер к домену с помощью adcli:
+
+Примечание: Используйте --login-ccache для adcli, чтобы использовать тот TGT, 
+который мы запросили ранее для аутентификации с помощью kinit and--host-
+keytab="", чтобы у нас был отдельный файл keytab.
+
+Примечание: параметр --domain-controller="" важен в этом случае, так как 
+невозможность запросить домен через DNS, передача его непосредственно в adcli 
+заставляет его искать адрес, который мы ранее настроили в /etc/hosts.
+
+~]# adcli join --login-ccache --domain-controller=msdc01.dir.sample.net --host-keytab=/
+etc/krb5.keytab_sample.net --domain-ou="ou=Servers,dc=old,dc=domain,dc=ru" 
+dir.sample.net --show-details
+
+[domain]        
+domain-name = old.domain.ru
+domain-realm = OLD.DOMAIN.RU           
+domain-controller = dc01.old.domain.ru
+domain-short = DIR        
+domain-SID = <omitted>
+naming-context = DC=old,DC=domain,DC=ru
+domain-ou = ou=Servers,dc=old,dc=domain,dc=ru
+[computer]
+host-fqdn = server01
+computer-name = server01
+computer-dn = CN=server01,ou=Servers,dc=old,dc=domain,dc=ru
+os-name = redhat-linux              
+[keytab]
+kvno = 2         
+keytab = /etc/krb5.keytab_sample.net
+
+Донастройка конфигурационного файла SSSD:
+
+Поскольку мы использовали realm для присоединения нашего сервера к первому 
+домену, у нас уже есть пример конфигурации для sssd. Использовав adcli для 
+вторичного, нам придется настроить его с нуля и добавить к доменам = ""
+
+~]# vim /etc/sssd/sssd.conf
+
+[sssd]
+domains = ad.domain.ru,old.domain.ru
+config_file_version = 2
+services = nss, pam
+
+[domain/ad.example.net]
+ad_domain = ad.domain.ru
+krb5_realm = AD.DOMAIN.RU
+id_provider = ad
+access_provider = simple
+realmd_tags = manages-system joined-with-adcli
+cache_credentials = True
+krb5_store_password_if_offline = True
+default_shell = /bin/bash
+ldap_id_mapping = True
+use_fully_qualified_names = False
+fallback_homedir = /home/%d/%u
+simple_allow_groups = G_Admin_Server_Server01@AD.DOMAIN.RU
+[domain/old.domain.ru]
+ad_server = dc01.old.domain.ru
+ad_domain = old.domain.ru
+krb5_realm = OLD.DOMAIN.RU
+realmd_tags = manages-system joined-with-adcli
+cache_credentials = True
+id_provider = ad
+krb5_store_password_if_offline = True
+default_shell = /bin/bash
+ldap_id_mapping = True
+use_fully_qualified_names = False
+fallback_homedir = /home/%d/%u
+access_provider = simple
+dyndns_update = false
+simple_allow_users = admin
+simple_allow_groups =
+krb5_keytab = /etc/krb5.keytab_sample.net
+ldap_krb5_keytab = /etc/krb5.keytab_sample.net
+Теперь мы можем перезапустить SSSD и проверить список сфер:
+
+~]# systemctl restart sssd
+~]# realm list
+old.domain.ru
+ type: kerberos
+ realm-name: OLD.DOMAIN.RU
+ domain-name: old.domain.ru
+ configured: kerberos-member
+ server-software: active-directory
+ client-software: sssd
+ required-package: oddjob
+ required-package: oddjob-mkhomedir
+ required-package: sssd
+ required-package: adcli
+ required-package: samba-common-tools
+ login-formats: %U
+ login-policy: allow-permitted-logins
+ permitted-logins: admin
+ permitted-groups: 
+ad.example.net
+ type: kerberos
+ realm-name: AD.DOMAIN.RU
+ domain-name: ad.domain.ru
+ configured: kerberos-member
+ server-software: active-directory
+ client-software: sssd
+ required-package: oddjob
+ required-package: oddjob-mkhomedir
+ required-package: sssd
+ required-package: adcli
+ required-package: samba-common-tools
+ login-formats: %U
+ login-policy: allow-permitted-logins
+ permitted-logins: 
+ permitted-groups: G_Admin_Server_Server01@AD.DOMAIN.RU
+
+Важно отметить, что в случае, если соглашение об именовании для пользователей 
+идентично на обоих серверах, лучше использовать значение 
+foruse_fully_qualified_names = True, чтобы не было конфликта между 
+пользователями из обоих доменов при входе в систему.
